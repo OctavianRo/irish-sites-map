@@ -1,0 +1,11 @@
+{
+  "name": "irish-sites-map",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Irish construction-site map and HGV route & driver planner",
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "build:sites": "node tools/build-sites-index.js",
+    "serve": "python3 -m http.server 8080"
+  }
+}
