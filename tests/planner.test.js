@@ -220,3 +220,21 @@ test('local road knowledge reaches the driver on national roads too', () => {
   assert.ok(r.warnings.some(w => /Barnesmore/.test(w.text)),
     'notes attached to national roads must not be filtered out');
 });
+
+test('a leg between two drops in the same town returns a complete route', () => {
+  // Two Eircodes in one routing area snap to the same network node. The route
+  // is empty, but every field callers rely on must still be there.
+  const r = P.searchRoute('W91_NOT_A_NODE', 'W91_NOT_A_NODE', VEH.resolve('ART-44'), 'balanced');
+  assert.strictEqual(r, null, 'unknown nodes still return null');
+
+  const same = P.searchRoute('NAAS', 'NAAS', VEH.resolve('ART-44'), 'balanced');
+  assert.ok(same);
+  for (const k of ['steps', 'warnings', 'tollsHit', 'nodes', 'polyline']) {
+    assert.ok(Array.isArray(same[k]), `missing ${k}`);
+  }
+  assert.strictEqual(same.km, 0);
+  assert.strictEqual(same.driveMin, 0);
+
+  const opts = P.routeOptions('NAAS', 'NAAS', VEH.resolve('ART-44'), {});
+  assert.ok(opts.recommended, 'routeOptions must cope with a zero-length leg');
+});

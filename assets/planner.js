@@ -78,7 +78,9 @@
     const obj = OBJECTIVES[objectiveKey] || OBJECTIVES.balanced;
     ctx = ctx || {};
     if (!NET.NODES.has(fromId) || !NET.NODES.has(toId)) return null;
-    if (fromId === toId) return { nodes: [fromId], legs: [], km: 0, driveMin: 0, tollEur: 0, cost: 0 };
+    // A drop in the same town as the last one has no network legs, but it must
+    // still come back with the full route shape - callers index into it.
+    if (fromId === toId) return summarise([], [fromId], vehicle, ctx, 0);
 
     const dist = new Map(), prev = new Map(), done = new Set();
     dist.set(fromId, 0);
@@ -555,6 +557,407 @@
     };
   }
 
+
+  // ================================================== day-plan building ====
+  /**
+   * Assigns an order book across the available vehicles, then routes each load.
+   *
+   * The constraints, in the order they bite:
+   *   1. Can this vehicle legally reach the drop at all? (road suitability)
+   *   2. Does the weight fit what the vehicle may be loaded to?
+   *   3. Does the day still fit inside the driver's duty window and EU 561?
+   *
+   * Loads are grown one drop at a time: seed with the most urgent unassigned
+   * order the vehicle can serve, then repeatedly add whichever remaining order
+   * is cheapest to slot in, discounted by how overdue it is. That keeps loads
+   * geographically tight without letting an old order sit forever because it
+   * happens to be awkward.
+   */
+
+  /** Days since the epoch, for comparing order and due dates cheaply. */
+  const dayNum = iso => {
+    const t = Date.parse(String(iso || '') + 'T00:00:00Z');
+    return Number.isFinite(t) ? Math.round(t / 86400000) : null;
+  };
+
+  /**
+   * How hard to pull an order into today's loads, in "minutes of detour we
+   * would accept to take it". Overdue work outranks convenient work.
+   */
+  function urgencyMin(d, todayNum) {
+    const due = dayNum(d.dueBy);
+    if (due != null) {
+      const slack = due - todayNum;               // negative once overdue
+      if (slack < 0) return 120 + Math.min(120, -slack * 30);
+      if (slack === 0) return 90;
+      if (slack === 1) return 45;
+      if (slack <= 3) return 15;
+      return 0;
+    }
+    const ordered = dayNum(d.orderedOn);
+    if (ordered == null) return 0;
+    return Math.min(90, Math.max(0, (todayNum - ordered - 2) * 12));
+  }
+
+  /** Most urgent first: overdue, then earliest due, then oldest order. */
+  function priorityRank(d, todayNum) {
+    return [-urgencyMin(d, todayNum), dayNum(d.dueBy) == null ? 1e6 : dayNum(d.dueBy),
+      dayNum(d.orderedOn) == null ? 1e6 : dayNum(d.orderedOn)];
+  }
+  const cmpRank = (a, b) => {
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return a[i] - b[i];
+    return 0;
+  };
+
+  function makeCosts(ctx) {
+    const nodeOf = new Map();
+    const nodeFor = p => {
+      const k = p.lat + ',' + p.lon;
+      if (!nodeOf.has(k)) nodeOf.set(k, NET.nearestNodes(p.lat, p.lon, 1)[0].node.id);
+      return nodeOf.get(k);
+    };
+    const legCache = new Map();
+    /** Routed driving minutes between two points for one vehicle, or null. */
+    const legMin = (v, p, q) => {
+      const a = nodeFor(p), b = nodeFor(q);
+      const key = v.code + '|' + a + '|' + b;
+      if (legCache.has(key)) return legCache.get(key);
+      let val;
+      if (a === b) {
+        val = NET.haversineKm(p.lat, p.lon, q.lat, q.lon) * 1.3 / 34 * 60;
+      } else {
+        const r = searchRoute(a, b, v, 'balanced', ctx);
+        val = r ? r.driveMin : null;
+      }
+      legCache.set(key, val);
+      return val;
+    };
+    return { nodeFor, legMin };
+  }
+
+  /**
+   * @param deliveries  drops from the order book: {lat, lon, weightT, dueBy, orderedOn, serviceMin, ...}
+   * @param fleet       [{id, driver, transportCode, depot, startTime, maxDutyMin, capacityOverrideT}]
+   * @param opts        {today, rates, defaultServiceMin, maxDropsPerLoad, returnToDepot, loadCaps, adr}
+   */
+  function buildDayPlan(deliveries, fleet, opts) {
+    opts = opts || {};
+    const ctx = { adr: !!opts.adr };
+    const rates = Object.assign({}, DEFAULT_RATES, opts.rates || {});
+    const todayNum = dayNum(opts.today) != null ? dayNum(opts.today)
+      : Math.round(Date.now() / 86400000);
+    const defaultServiceMin = opts.defaultServiceMin != null ? opts.defaultServiceMin : 40;
+    const maxDrops = opts.maxDropsPerLoad || 12;
+    const { legMin } = makeCosts(ctx);
+
+    const vehicles = (fleet || []).map(f => {
+      const v = VEH.resolve(f.transportCode, opts.loadCaps ? { loadCaps: opts.loadCaps } : null);
+      if (!v) return null;
+      const cap = f.capacityOverrideT != null ? +f.capacityOverrideT : v.capacityT;
+      return Object.assign({}, f, {
+        vehicle: v,
+        capacityT: cap,
+        maxDutyMin: f.maxDutyMin || HOS.normalDutyWindowMin,
+        depot: f.depot,
+      });
+    }).filter(Boolean);
+
+    const pool = (deliveries || []).filter(d => Number.isFinite(d.lat) && Number.isFinite(d.lon));
+    const assigned = new Set();
+    const loads = [];
+    const heaviestCap = vehicles.reduce((m, u) => Math.max(m, u.capacityT), 0);
+    const allowReloads = opts.allowReloads !== false;
+    const reloadMin = opts.reloadMin != null ? opts.reloadMin : 45;
+    const maxTrips = allowReloads ? (opts.maxTripsPerVehicle || 3) : 1;
+    const stopReasons = [];
+
+    // Big trucks pick first, so the heavy orders are not stranded by a van
+    // having already taken the easy work.
+    const order = vehicles.slice().sort((a, b) => b.capacityT - a.capacityT);
+
+    for (const unit of order) {
+      const v = unit.vehicle;
+      const depot = unit.depot;
+
+      /**
+       * A vehicle's day is one schedule: depot, drops, back to the depot to
+       * reload, more drops. Modelling a reload as a service stop at the yard
+       * means EU 561 breaks, the duty window and the running clock all come
+       * out of the same calculation instead of being stitched together.
+       */
+      const stopsFor = trips => {
+        const stops = [Object.assign({ serviceMin: 0 }, depot)];
+        trips.forEach((trip, ti) => {
+          if (ti > 0) stops.push(Object.assign({}, depot, {
+            name: `${depot.name} — reload`, serviceMin: reloadMin, isReload: true,
+          }));
+          for (const d of trip) {
+            stops.push({
+              name: d.customer || d.ref || d.eircode, lat: d.lat, lon: d.lon,
+              serviceMin: d.serviceMin != null ? d.serviceMin : defaultServiceMin,
+              delivery: d,
+            });
+          }
+        });
+        if (opts.returnToDepot) {
+          stops.push(Object.assign({}, depot, { name: depot.name + ' (return)', serviceMin: 0 }));
+        }
+        return stops;
+      };
+
+      const tryPlan = trips => {
+        const p = planSchedule({
+          driver: unit.driver, transportCode: v.code, vehicleOverrides: unit.vehicleOverrides,
+          startTime: unit.startTime || '07:00', adr: opts.adr, defaultServiceMin,
+          stops: stopsFor(trips),
+        }, { rates });
+        if (p.error || p.blockers.length) return null;
+        if (p.compliance.violations.length) return null;
+        if (p.totals.dutyMin > unit.maxDutyMin) return null;
+        return p;
+      };
+
+      let trips = [];
+      let plan = null;
+      let stopped = 'no-candidates';
+
+      while (true) {
+        const dropCount = trips.reduce((a, t) => a + t.length, 0);
+        if (dropCount >= maxDrops) { stopped = 'max-drops'; break; }
+
+        // Not taken by another vehicle, and not already on one of this
+        // vehicle's own earlier trips.
+        const mine = new Set(trips.flat().map(d => d.id));
+        const free = pool.filter(d => !assigned.has(d.id) && !mine.has(d.id));
+        if (!free.length) { stopped = 'nothing-left'; break; }
+
+        const current = trips.length ? trips[trips.length - 1] : null;
+        const tripWeight = current ? current.reduce((a, d) => a + (d.weightT || 0), 0) : 0;
+        const roomInTrip = unit.capacityT - tripWeight;
+
+        let fits = current ? free.filter(d => (d.weightT || 0) <= roomInTrip + 1e-9) : [];
+        let openingNewTrip = false;
+        if (!current || !fits.length) {
+          if (current && trips.length >= maxTrips) { stopped = 'max-trips'; break; }
+          if (current && !current.length) { stopped = 'empty-trip'; break; }
+          fits = free.filter(d => (d.weightT || 0) <= unit.capacityT + 1e-9);
+          openingNewTrip = !!current;
+          if (!fits.length) { stopped = current ? 'weight' : 'weight'; break; }
+        }
+
+        // Shortlist by proximity to where the vehicle currently is, plus the
+        // most urgent orders wherever they are, so old work is not orphaned.
+        const anchor = (!openingNewTrip && current && current.length)
+          ? current[current.length - 1] : depot;
+        const near = fits
+          .map(d => ({ d, straight: NET.haversineKm(anchor.lat, anchor.lon, d.lat, d.lon) }))
+          .sort((a, b) => a.straight - b.straight).slice(0, 14).map(x => x.d);
+        const urgent = fits.slice()
+          .sort((a, b) => cmpRank(priorityRank(a, todayNum), priorityRank(b, todayNum))).slice(0, 4);
+
+        let best = null;
+        for (const d of [...new Set(near.concat(urgent))]) {
+          const add = legMin(v, anchor, d);
+          if (add == null) continue;                       // vehicle cannot reach it
+          const score = add - urgencyMin(d, todayNum);
+          if (!best || score < best.score) best = { d, score };
+        }
+        if (!best) { stopped = 'unreachable'; break; }
+
+        const trial = trips.map(t => t.slice());
+        if (openingNewTrip || !current) trial.push([best.d]);
+        else trial[trial.length - 1].push(best.d);
+
+        // Resequence the trip we just touched.
+        const ti = trial.length - 1;
+        if (trial[ti].length > 2) {
+          trial[ti] = optimiseOrder([depot].concat(trial[ti]), v, { fixedEnd: false, ctx })
+            .stops.slice(1);
+        }
+
+        const p = tryPlan(trial);
+        if (!p) { stopped = openingNewTrip ? 'hours-no-second-trip' : 'hours'; break; }
+
+        trips = trial;
+        plan = p;
+      }
+
+      trips = trips.filter(t => t.length);
+      trips.forEach(t => t.forEach(d => assigned.add(d.id)));
+      const carried = trips.flat();
+      const weightT = carried.reduce((a, d) => a + (d.weightT || 0), 0);
+      const peakTripT = trips.reduce((m, t) =>
+        Math.max(m, t.reduce((a, d) => a + (d.weightT || 0), 0)), 0);
+      stopReasons.push(stopped);
+
+      loads.push({
+        id: unit.id, driver: unit.driver, transportCode: v.code, vehicle: v,
+        depot, startTime: unit.startTime || '07:00',
+        trips, deliveries: carried,
+        weightT: Math.round(weightT * 100) / 100,
+        peakTripT: Math.round(peakTripT * 100) / 100,
+        capacityT: unit.capacityT,
+        utilPct: unit.capacityT ? Math.round(peakTripT / unit.capacityT * 100) : 0,
+        plan: carried.length ? plan : null,
+        stoppedBecause: stopped,
+        replan: tryPlan,
+      });
+    }
+
+    // ------------------------------------------------- second-chance pass ---
+    // The first pass is greedy per vehicle, so an order can be left over
+    // simply because of the order the trucks picked. Before giving up on
+    // anything, try to slot each leftover into every load at every position
+    // and keep the cheapest placement that stays legal.
+    let budget = opts.replanBudget != null ? opts.replanBudget : 900;
+    let placedMore = true;
+    while (placedMore && budget > 0) {
+      placedMore = false;
+      const leftovers = pool.filter(d => !assigned.has(d.id))
+        .sort((a, b) => cmpRank(priorityRank(a, todayNum), priorityRank(b, todayNum)));
+
+      for (const d of leftovers) {
+        let best = null;
+        for (const load of loads) {
+          if (!load.trips.length) continue;
+          for (let ti = 0; ti < load.trips.length && budget > 0; ti++) {
+            const tripT = load.trips[ti].reduce((a, x) => a + (x.weightT || 0), 0);
+            if ((d.weightT || 0) > load.capacityT - tripT + 1e-9) continue;
+            for (let pos = 0; pos <= load.trips[ti].length && budget > 0; pos++) {
+              const trial = load.trips.map(t => t.slice());
+              trial[ti].splice(pos, 0, d);
+              budget--;
+              const p = load.replan(trial);
+              if (!p) continue;
+              const delta = p.totals.driveMin - (load.plan ? load.plan.totals.driveMin : 0);
+              if (!best || delta < best.delta) best = { load, trial, plan: p, delta };
+            }
+          }
+        }
+        if (best) {
+          best.load.trips = best.trial;
+          best.load.plan = best.plan;
+          assigned.add(d.id);
+          placedMore = true;
+        }
+      }
+    }
+    // ----------------------------------------------------- relocate pass ---
+    // Greedy assignment strands work on the wrong truck: the big unit takes
+    // the convenient drops first, and a small one is left crossing the country
+    // twice. Try moving each drop to another vehicle and keep the move if the
+    // fleet's total driving falls and both days stay legal.
+    const driveOf = l => (l.plan ? l.plan.totals.driveMin : 0);
+    let moved = true, rounds = 0;
+    while (moved && rounds++ < 3 && budget > 0) {
+      moved = false;
+      for (const from of loads) {
+        if (!from.trips.length) continue;
+        for (const d of from.deliveries.slice()) {
+          if (budget <= 0) break;
+          const without = from.trips.map(t => t.filter(x => x.id !== d.id)).filter(t => t.length);
+          budget--;
+          const fromPlan = without.length ? from.replan(without) : null;
+          if (without.length && !fromPlan) continue;
+          const fromDrive = without.length ? fromPlan.totals.driveMin : 0;
+
+          let best = null;
+          for (const to of loads) {
+            if (to === from || budget <= 0) continue;
+            const targets = to.trips.length ? to.trips : [[]];
+            for (let ti = 0; ti < targets.length && budget > 0; ti++) {
+              const tripT = targets[ti].reduce((a, x) => a + (x.weightT || 0), 0);
+              if ((d.weightT || 0) > to.capacityT - tripT + 1e-9) continue;
+              for (let pos = 0; pos <= targets[ti].length && budget > 0; pos++) {
+                const trial = targets.map(t => t.slice());
+                trial[ti].splice(pos, 0, d);
+                budget--;
+                const p = to.replan(trial);
+                if (!p) continue;
+                const delta = (fromDrive + p.totals.driveMin) - (driveOf(from) + driveOf(to));
+                if (delta < -2 && (!best || delta < best.delta)) {
+                  best = { to, trial, plan: p, delta };
+                }
+              }
+            }
+          }
+          if (best) {
+            from.trips = without;
+            from.plan = without.length ? fromPlan : null;
+            best.to.trips = best.trial;
+            best.to.plan = best.plan;
+            moved = true;
+          }
+        }
+      }
+    }
+
+    for (const load of loads) {
+      load.deliveries = load.trips.flat();
+      load.weightT = round2(load.deliveries.reduce((a, x) => a + (x.weightT || 0), 0));
+      load.peakTripT = round2(load.trips.reduce((m, t) =>
+        Math.max(m, t.reduce((a, x) => a + (x.weightT || 0), 0)), 0));
+      load.utilPct = load.capacityT ? Math.round(load.peakTripT / load.capacityT * 100) : 0;
+      delete load.replan;
+    }
+
+    // --------------------------------------------------------- leftovers ---
+    const hoursBound = stopReasons.some(r => /hours|max-drops|max-trips/.test(r));
+    const unassigned = [];
+    for (const d of pool) {
+      if (assigned.has(d.id)) continue;
+      unassigned.push({ delivery: d, reason: whyNotLoaded(d, vehicles, heaviestCap, ctx, hoursBound) });
+    }
+
+    const totalT = pool.reduce((a, d) => a + (d.weightT || 0), 0);
+    const loadedT = loads.reduce((a, l) => a + l.weightT, 0);
+    const working = loads.filter(l => l.plan);
+    return {
+      loads, unassigned,
+      summary: {
+        deliveries: pool.length,
+        loaded: pool.length - unassigned.length,
+        unassigned: unassigned.length,
+        vehiclesUsed: working.length,
+        vehiclesIdle: loads.length - working.length,
+        trips: working.reduce((a, l) => a + l.trips.length, 0),
+        totalT: Math.round(totalT * 100) / 100,
+        loadedT: Math.round(loadedT * 100) / 100,
+        km: Math.round(working.reduce((a, l) => a + l.plan.totals.km, 0) * 10) / 10,
+        driveMin: working.reduce((a, l) => a + l.plan.totals.driveMin, 0),
+        costEur: round2(working.reduce((a, l) => a + (l.plan.money ? l.plan.money.totalEur : 0), 0)),
+        costPerTonne: loadedT > 0
+          ? round2(working.reduce((a, l) => a + (l.plan.money ? l.plan.money.totalEur : 0), 0) / loadedT)
+          : 0,
+      },
+    };
+  }
+
+  /** Why an order did not make it onto a truck - specific, never just "no". */
+  function whyNotLoaded(d, vehicles, heaviestCap, ctx, hoursBound) {
+    if (d.weightT != null && heaviestCap > 0 && d.weightT > heaviestCap) {
+      return { code: 'over-capacity',
+        text: `${d.weightT}t is more than the heaviest available unit may carry (${heaviestCap}t). Split the order or plate a bigger vehicle.` };
+    }
+    const reachable = vehicles.filter(u =>
+      searchRoute(NET.nearestNodes(u.depot.lat, u.depot.lon, 1)[0].node.id,
+        NET.nearestNodes(d.lat, d.lon, 1)[0].node.id, u.vehicle, 'balanced', ctx));
+    if (!reachable.length) {
+      const alt = largestCodeThatCanRun(
+        NET.nearestNodes(vehicles[0] ? vehicles[0].depot.lat : 53.3, vehicles[0] ? vehicles[0].depot.lon : -6.3, 1)[0].node.id,
+        NET.nearestNodes(d.lat, d.lon, 1)[0].node.id, ctx, null);
+      return { code: 'unreachable',
+        text: alt
+          ? `No vehicle on today's fleet can legally reach ${d.area || d.eircode}. A ${alt.code} could.`
+          : `No road route for any vehicle to ${d.area || d.eircode}. Check the Eircode.` };
+    }
+    return hoursBound
+      ? { code: 'hours',
+          text: 'Every vehicle ran out of driving hours before this order. Add a unit, start earlier, or roll it to tomorrow.' }
+      : { code: 'no-room',
+          text: 'The fleet ran out of payload before this order. Add a vehicle or roll it to tomorrow.' };
+  }
+
   // ------------------------------------------------- fleet-level advice ---
   /**
    * Given a set of stops, says which transport codes can actually serve them
@@ -583,6 +986,7 @@
     DEFAULT_RATES, HOS, OBJECTIVES,
     searchRoute, routeOptions, itinerary, money,
     assessAccess, zoneCheck, planSchedule, optimiseOrder, fleetFit, largestCodeThatCanRun,
+    buildDayPlan, urgencyMin, priorityRank, dayNum,
     hhmmToMin, minToHHMM, minToHrs, modDay,
   };
 });

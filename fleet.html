@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>HGV Route &amp; Driver Planner — Ireland</title>
-<meta name="description" content="Plan driver schedules by transport code, check whether an artic or rigid can actually use the roads, and get a recommended route.">
+<title>Delivery Route Planner — Ireland</title>
+<meta name="description" content="Load an order book of Eircode deliveries, respect vehicle weight limits and road suitability, and get an optimised route plan per driver.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230f1216'/%3E%3Cpath d='M4 20h13V10H8L4 15z' fill='%2338bdf8'/%3E%3Crect x='18' y='8' width='10' height='12' rx='1' fill='%2338bdf8'/%3E%3Ccircle cx='9' cy='23' r='3' fill='%239aa7b4'/%3E%3Ccircle cx='23' cy='23' r='3' fill='%239aa7b4'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <link rel="stylesheet" href="assets/planner.css">
@@ -12,99 +12,39 @@
 <body>
 <div class="app">
 
-  <!-- ============================================ schedule builder ==== -->
+  <!-- ================================================ orders + fleet ==== -->
   <section class="col">
     <div class="chead">
       <div>
-        <h1>HGV Route &amp; Driver Planner</h1>
-        <div class="sub">Ireland &amp; Northern Ireland · artic / rigid suitability</div>
+        <h1>Delivery Route Planner</h1>
+        <div class="sub">Eircode order book → load plan → route</div>
       </div>
       <div class="spacer"></div>
-      <a class="btn small ghost" href="index.html" title="Back to the site map">Sites map</a>
+      <a class="btn small ghost" href="index.html" title="Construction site map">Sites map</a>
     </div>
 
-    <div class="scroll">
-      <div class="runs" id="runs"></div>
+    <nav class="tabs" id="ltabs">
+      <button class="tab on" data-ltab="orders">Orders <span class="badge" id="b-orders">0</span></button>
+      <button class="tab" data-ltab="fleet">Fleet <span class="badge" id="b-fleet">0</span></button>
+      <button class="tab" data-ltab="settings">Settings</button>
+    </nav>
 
-      <div class="row">
-        <div class="field"><label for="f-driver">Driver</label>
-          <input type="text" id="f-driver" placeholder="e.g. J. Murphy" autocomplete="off"></div>
-        <div class="field" style="flex:0 0 116px"><label for="f-date">Date</label>
-          <input type="date" id="f-date"></div>
-      </div>
+    <div class="scroll" id="lpane"></div>
 
-      <div class="field">
-        <label for="f-code">Transport code</label>
-        <select id="f-code"></select>
-        <div class="small dim" id="code-detail" style="margin-top:6px"></div>
-      </div>
-
-      <div class="row">
-        <div class="field"><label for="f-start">Start time</label>
-          <input type="time" id="f-start" value="07:00" step="300"></div>
-        <div class="field"><label for="f-service">Default offload (min)</label>
-          <input type="number" id="f-service" value="45" min="0" max="480" step="5"></div>
-      </div>
-
-      <label class="check"><input type="checkbox" id="f-adr">
-        Load includes dangerous goods (ADR)</label>
-      <label class="check"><input type="checkbox" id="f-return">
-        Return to the start point at the end of the day</label>
-
-      <div class="field" style="margin-top:14px">
-        <label for="f-search">Add a stop</label>
-        <div class="search-wrap">
-          <input type="text" id="f-search" autocomplete="off" spellcheck="false"
-                 placeholder="Town, planning ref, address, or 53.3498,-6.2603">
-          <div class="results" id="f-results"></div>
-        </div>
-        <div class="small dim" style="margin-top:5px">
-          Searches 3,735 live construction sites and every town on the network. Or click the map.
-        </div>
-      </div>
-
-      <div class="stops" id="stops"></div>
-
-      <div class="btnrow">
-        <button class="btn primary" id="btn-plan">Plan the day</button>
-        <button class="btn" id="btn-optimise" title="Reorder the drops to cut driving time">Optimise order</button>
-      </div>
-      <div class="btnrow" style="margin-top:6px">
-        <button class="btn small" id="btn-newrun">New run</button>
-        <button class="btn small" id="btn-duperun">Duplicate</button>
-        <button class="btn small" id="btn-csv">Export CSV</button>
-        <button class="btn small ghost danger" id="btn-clear">Clear stops</button>
-      </div>
-
-      <div class="sec" style="margin-top:20px">
-        <h3>Operating rates</h3>
-        <div class="row">
-          <div class="field"><label for="r-diesel">Diesel €/l</label>
-            <input type="number" id="r-diesel" value="1.75" step="0.01" min="0"></div>
-          <div class="field"><label for="r-driver">Driver €/h</label>
-            <input type="number" id="r-driver" value="22" step="0.5" min="0"></div>
-          <div class="field"><label for="r-run">Running €/km</label>
-            <input type="number" id="r-run" value="0.18" step="0.01" min="0"></div>
-        </div>
-      </div>
+    <div class="footbar">
+      <button class="btn primary" id="btn-plan">Build the plan</button>
+      <button class="btn" id="btn-csv" title="Copy the plan as CSV">Export</button>
     </div>
   </section>
 
   <!-- ==================================================== map ========== -->
   <section class="col col-map">
     <div id="map"></div>
-    <div class="mapnote" id="mapnote">
-      Click anywhere on the map to add that point as a stop.
-    </div>
-    <div class="maplegend">
-      <div class="lrow"><span class="sw" style="background:#38bdf8"></span> Recommended route</div>
-      <div class="lrow"><span class="sw" style="background:#f59e0b"></span> Tight for this vehicle</div>
-      <div class="lrow"><span class="sw" style="background:#6b7885"></span> Alternative option</div>
-      <div class="lrow"><span class="sw" style="background:#ef4444;height:3px"></span> Barred for this vehicle</div>
-    </div>
+    <div class="mapnote" id="mapnote">Drops are placed by Eircode routing area unless the order line carried coordinates.</div>
+    <div class="maplegend" id="maplegend"></div>
   </section>
 
-  <!-- ================================================ results ========== -->
+  <!-- ================================================== the plan ======= -->
   <section class="col">
     <div class="chead">
       <h2 id="res-title">Plan</h2>
@@ -112,9 +52,9 @@
       <span class="small dim" id="res-sub"></span>
     </div>
     <nav class="tabs" id="tabs">
-      <button class="tab on" data-tab="plan">Day</button>
+      <button class="tab on" data-tab="loads">Loads</button>
+      <button class="tab" data-tab="day">Driver day</button>
       <button class="tab" data-tab="roads">Roads <span class="badge" id="b-roads">0</span></button>
-      <button class="tab" data-tab="fleet">Fleet fit</button>
       <button class="tab" data-tab="ref">Reference</button>
     </nav>
     <div class="scroll" id="pane"></div>
@@ -125,8 +65,10 @@
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="assets/sites-index.js"></script>
+<script src="assets/eircode.js"></script>
 <script src="assets/vehicles.js"></script>
 <script src="assets/network.js"></script>
+<script src="assets/orders.js"></script>
 <script src="assets/planner.js"></script>
 <script src="assets/ui.js"></script>
 </body>

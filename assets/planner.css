@@ -255,3 +255,61 @@ table.grid td.num{font:11.5px/1.5 var(--mono);text-align:right;font-variant-nume
   .col-map{height:60vh;min-height:380px}
   .scroll{max-height:none;overflow:visible}
 }
+
+/* ------------------------------------------------------- order book ------ */
+.footbar{flex:0 0 auto;padding:10px 14px;border-top:1px solid var(--line);
+  background:var(--panel);display:flex;gap:8px}
+.footbar .btn{flex:1}
+.footbar .btn.primary{flex:2}
+
+textarea.paste{width:100%;min-height:104px;resize:vertical;font:11.5px/1.5 var(--mono);
+  background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 9px;
+  color:var(--text);white-space:pre;overflow-x:auto}
+.dropzone{border:1px dashed var(--line2);border-radius:9px;padding:10px;text-align:center;
+  color:var(--dim);font-size:12px;margin-bottom:8px;cursor:pointer;transition:.14s}
+.dropzone:hover,.dropzone.over{border-color:var(--accent);color:var(--text);
+  background:rgba(56,189,248,.06)}
+
+.orow{display:grid;grid-template-columns:auto 1fr auto auto;gap:8px;align-items:center;
+  padding:6px 8px;border-bottom:1px solid var(--line);font-size:12.3px}
+.orow:hover{background:var(--panel2)}
+.orow .swatch{width:4px;height:26px;border-radius:2px;background:var(--line2)}
+.orow .r1{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.orow .r2{font:10.5px/1.4 var(--mono);color:var(--dim);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.orow .wt{font:600 12px/1 var(--mono);text-align:right;white-space:nowrap}
+.orow.bad{background:rgba(239,68,68,.07)}
+
+.prec{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:4px;
+  vertical-align:middle}
+.prec.exact{background:var(--ok)}
+.prec.routing-key{background:var(--caution)}
+
+.frow{display:grid;grid-template-columns:1fr 1fr;gap:7px;background:var(--panel2);
+  border:1px solid var(--line);border-radius:9px;padding:9px;margin-bottom:8px}
+.frow .full{grid-column:1/-1}
+.frow .hd{display:flex;align-items:center;gap:8px;grid-column:1/-1;margin-bottom:2px}
+.frow .hd .nm{font-weight:600;font-size:12.5px;flex:1}
+.frow label{display:block;font-size:10px;text-transform:uppercase;letter-spacing:.5px;
+  color:var(--dim);margin-bottom:3px}
+
+/* ------------------------------------------------------------- loads ----- */
+.load{border:1px solid var(--line);border-radius:10px;margin-bottom:9px;overflow:hidden;
+  cursor:pointer;transition:border-color .14s}
+.load:hover{border-color:var(--line2)}
+.load.sel{border-color:var(--accent);box-shadow:0 0 0 1px rgba(56,189,248,.2)}
+.load .lh{display:flex;gap:9px;align-items:center;padding:9px 11px;background:var(--panel2)}
+.load .cid{width:10px;height:28px;border-radius:3px;flex:none}
+.load .who{flex:1;min-width:0}
+.load .who .a{font-weight:600;font-size:12.8px}
+.load .who .b{font:10.5px/1.4 var(--mono);color:var(--dim)}
+.load .figs{text-align:right;font:11px/1.45 var(--mono);color:var(--muted);white-space:nowrap}
+.load .lb{padding:8px 11px;border-top:1px solid var(--line);background:var(--panel)}
+.bar{height:5px;border-radius:3px;background:var(--panel3);overflow:hidden;margin:5px 0 2px}
+.bar i{display:block;height:100%;border-radius:3px}
+.trip{font:11.5px/1.6 var(--mono);margin:5px 0}
+.trip .th{color:var(--dim);text-transform:uppercase;font-size:9.5px;letter-spacing:.6px}
+.trip .d{display:grid;grid-template-columns:16px 1fr auto;gap:7px}
+.trip .d .n{color:var(--dim)}
+.trip .d .p{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.idle{opacity:.55}

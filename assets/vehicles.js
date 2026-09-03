@@ -96,6 +96,15 @@
 
   const BY_CODE = new Map(PROFILES.map(p => [p.code, p]));
 
+  /**
+   * Fleet-wide ceilings on what a vehicle may be loaded to, by body type.
+   * These sit on top of the physical payload: the usable capacity is whichever
+   * is lower. Operators run rules like "nothing over 28t on a rigid" for
+   * reasons that are theirs (axle plating, customer sites, insurance), so this
+   * is a first-class setting rather than something buried in a profile.
+   */
+  const CLASS_LOAD_CAP_T = { artic: 29, rigid: 28, van: 1.5 };
+
   /** Goods vehicles over 3.5t are limited to 80 km/h on every Irish road class. */
   const HGV_SPEED_CAP_KPH = 80;
 
@@ -109,6 +118,26 @@
 
   /** Payload in tonnes once the vehicle's own weight is off the bridge. */
   const payloadT = v => Math.round((v.gvwT - v.tareT) * 10) / 10;
+
+  /** What the vehicle may actually be loaded to: physics, then the fleet rule. */
+  function capacityT(v, caps) {
+    const cap = (caps || CLASS_LOAD_CAP_T)[v.form];
+    const physical = payloadT(v);
+    return Math.round(Math.min(physical, cap == null ? Infinity : cap) * 10) / 10;
+  }
+
+  /**
+   * Statutory maximum gross weight in Ireland for a given axle count, used to
+   * flag a hand-edited profile that could not be plated as described.
+   * (SI 5/2003 as amended.)
+   */
+  const LEGAL_GROSS_T = { 2: 18, 3: 26, 4: 32, 5: 42, 6: 44 };
+  function grossCheck(v) {
+    const limit = LEGAL_GROSS_T[v.axles];
+    if (limit == null) return null;
+    if (v.gvwT <= limit) return null;
+    return `${v.gvwT}t on ${v.axles} axles is over the ${limit}t Irish limit for that configuration.`;
+  }
 
   function get(code) {
     return BY_CODE.get(String(code || '').trim().toUpperCase()) || null;
@@ -125,9 +154,12 @@
     if (!base) merged.code = String(code || 'CUSTOM').toUpperCase();
     merged.tollClass = tollClass(merged);
     merged.payloadT = payloadT(merged);
+    merged.capacityT = capacityT(merged, (overrides && overrides.loadCaps) || CLASS_LOAD_CAP_T);
+    merged.grossWarning = grossCheck(merged);
     merged.isHGV = merged.gvwT > 3.5;
     return merged;
   }
 
-  return { PROFILES, HGV_SPEED_CAP_KPH, get, resolve, tollClass, payloadT };
+  return { PROFILES, HGV_SPEED_CAP_KPH, CLASS_LOAD_CAP_T, LEGAL_GROSS_T,
+    get, resolve, tollClass, payloadT, capacityT, grossCheck };
 });
